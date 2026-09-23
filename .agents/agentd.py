@@ -23,6 +23,7 @@ Commands:
     serve             Run the long-lived supervisor daemon
     spawn <name> <task>  Spawn a new sub-agent with a task
     status            Show status of all agents
+    monitor           Render the live agent monitor panel (window 0)
     send <agent_id>   Send a message to an agent (reads from stdin)
     stop <agent_id>   Stop a specific agent
     kill-all          Stop all agents and clean up
@@ -39,6 +40,7 @@ import time
 import argparse
 from pathlib import Path
 from datetime import datetime
+from uuid import uuid4
 
 
 class AgentOrchestrator:
@@ -206,17 +208,17 @@ class AgentOrchestrator:
         conn.commit()
         conn.close()
 
-    def _mark_status(self, agent_id: str, status: str, ended: bool = False):
-        """Update an agent's registry status and emit a status_changed event."""
+    def _mark_status(self, agent_id: str, status: str, ended: bool = False, event: str = "agent.status_changed"):
+        """Update an agent's registry status and emit a lifecycle event."""
         conn = self._db()
         ended_sql = ", ended_at=CURRENT_TIMESTAMP" if ended else ""
         conn.execute(
             f"UPDATE agents SET status=?, last_event=?, updated_at=CURRENT_TIMESTAMP{ended_sql} WHERE id=?",
-            (status, f"status={status}", agent_id)
+            (status, event, agent_id)
         )
         conn.commit()
         conn.close()
-        self.log_agent_event(agent_id, "status_changed", {"status": status})
+        self.log_agent_event(agent_id, event, {"status": status})
         print(f"agent {agent_id} -> {status}", file=sys.stderr)
 
     def tmux_command(self, *args):
@@ -300,22 +302,15 @@ class AgentOrchestrator:
 
         # Create session with monitor window (window 0)
         monitor_script = f"""bash -c '
+clear
 echo "Agent Monitor - Project: {self.project_name}";
-echo "No agents running yet.";
-echo "";
-echo "Available commands:";
-echo "  agentd.py spawn <name> <task>   - Spawn a sub-agent";
-echo "  agentd.py status                - Show agent status";
-echo "";
-echo "Waiting for agents to be spawned...";
 echo "";
 # Keep monitoring - show live agent status
 while true; do
-  sleep 5
+  clear
+  python3 "{self.agents_dir}/agentd.py" monitor 2>/dev/null || true
   echo ""
-  echo "=== $(date) ==="
-  python3 "{self.agents_dir}/agentd.py" status 2>/dev/null || true
-  echo ""
+  sleep 3
 done
 '
 """
@@ -433,9 +428,13 @@ done
                                         self.log_message(from_agent, to_agent, msg_type, msg)
                                         self._apply_message_effects(agent_name, msg_type, msg)
 
-                                        # If this is for us, log it
-                                        if to_agent == agent_name:
-                                            self.log_agent_event(agent_name, "message_received", msg)
+                                        # Structured event for the audit trail.
+                                        self.log_agent_event(agent_name, "agent.message", {
+                                            "type": msg_type,
+                                            "from": from_agent,
+                                            "to": to_agent,
+                                            **msg
+                                        })
 
                                         print(f"Comms: {msg}", file=sys.stderr)
                                     except json.JSONDecodeError:
@@ -470,7 +469,16 @@ done
         conn.close()
 
         if before and before["status"] != status:
-            self.log_agent_event(agent_id, "status_changed", {"status": status})
+            # Map lifecycle statuses to structured events.
+            if status == "blocked":
+                event = "agent.blocked"
+            elif status in ("finished", "complete", "done"):
+                event = "agent.finished"
+            elif status == "failed":
+                event = "agent.failed"
+            else:
+                event = "agent.status_changed"
+            self.log_agent_event(agent_id, event, {"status": status})
             print(f"agent {agent_id} -> {status} (via comms)", file=sys.stderr)
 
     def _next_window_index(self):
@@ -487,7 +495,7 @@ done
 
     def spawn_agent(self, name: str, task: str, parent: str = "orchestrator"):
         """Spawn a new sub-agent with a specific task."""
-        agent_id = f"agent-{int(time.time())}"
+        agent_id = f"agent-{int(time.time())}-{uuid4().hex[:6]}"
         window_index = self._next_window_index()
         window_name = name.replace(" ", "-").lower()
 
@@ -567,8 +575,8 @@ done
             "created_at": datetime.now().isoformat()
         }
 
-        # Log to database
-        self.log_agent_event(agent_id, "spawned", {
+        # Log to database - structured lifecycle events
+        self.log_agent_event(agent_id, "agent.created", {
             "name": name,
             "task": task,
             "window_index": window_index,
@@ -587,6 +595,12 @@ done
         )
         conn.commit()
         conn.close()
+
+        self.log_agent_event(agent_id, "agent.started", {
+            "window_index": window_index,
+            "window_name": window_name,
+            "pid": pid
+        })
 
         # Switch to the agent window
         self.tmux_command("select-window", f"-t={self.session_name}:{window_name}")
@@ -674,6 +688,78 @@ done
 
         conn.close()
 
+    STATUS_MARKS = {
+        "created": "○",
+        "starting": "◐",
+        "running": "●",
+        "working": "●",
+        "idle": "○",
+        "waiting": "○",
+        "blocked": "⚠",
+        "testing": "◐",
+        "review": "◆",
+        "finished": "✓",
+        "failed": "✗",
+        "stopped": "■",
+        "unknown": "?",
+    }
+
+    def monitor(self):
+        """Render the agent monitor panel (window 0).
+
+        Shows one compact box per agent with name, status, task, the last
+        structured event, and the window index. This is the human's primary
+        observation window; it must never affect the agents themselves.
+        """
+        conn = self._db()
+        cursor = conn.execute("""
+            SELECT id, name, status, window_index, window_name,
+                   branch, pid, created_at, updated_at
+            FROM agents
+            ORDER BY window_index, created_at
+        """)
+        agents = cursor.fetchall()
+
+        rows = []
+        for agent in agents:
+            task_row = conn.execute(
+                "SELECT task FROM tasks WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                (agent['id'],)
+            ).fetchone()
+            task = task_row['task'] if task_row else "none"
+
+            event_row = conn.execute(
+                "SELECT event_type, created_at FROM agent_events "
+                "WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
+                (agent['id'],)
+            ).fetchone()
+            last_event = event_row['event_type'] if event_row else "none"
+            last_at = event_row['created_at'] if event_row else ""
+
+            status = agent['status']
+            mark = self.STATUS_MARKS.get(status, self.STATUS_MARKS["unknown"])
+            rows.append((agent, mark, task, last_event, last_at))
+
+        conn.close()
+
+        width = 74
+        print(f"AGENTS  |  {self.project_name}")
+        print("─" * width)
+        if not rows:
+            print("No agents registered yet.")
+            print("  Spawn one: agentd.py spawn <name> <task>")
+        else:
+            for agent, mark, task, last_event, last_at in rows:
+                window = agent['window_index'] if agent['window_index'] is not None else "-"
+                branch = agent['branch'] or "-"
+                pid = agent['pid'] or "-"
+                print(f"{mark} {agent['name']:<18} [{agent['status']}] w{window}  {task}")
+                print(f"    last: {last_event} {last_at}  branch: {branch}  pid: {pid}")
+        print("─" * width)
+        active = sum(1 for a, *_ in rows if a['status'] not in ("finished", "failed", "stopped"))
+        print(f"{len(rows)} agent(s) | {active} active")
+        print("jump: Ctrl+B then window number | detach: Ctrl+B D")
+
     def send_message(self, agent_id: str):
         """Send a message to an agent (reads from stdin)."""
         conn = self._db()
@@ -712,7 +798,7 @@ done
             self.tmux_command("kill-window", f"-t={self.session_name}:{row['window_name']}")
 
         self.agents.pop(agent_id, None)
-        self.log_agent_event(agent_id, "stopped", {})
+        self.log_agent_event(agent_id, "agent.exited", {"reason": "stopped", "status": "stopped"})
 
         print(f"Stopped agent: {agent_id}")
 
@@ -803,7 +889,7 @@ done
             # Pane/window is gone. Only conclude "finished" after we have seen
             # the pane at least once, so we don't kill brand-new agents.
             if prev is not None:
-                self._mark_status(row["id"], "finished", ended=True)
+                self._mark_status(row["id"], "finished", ended=True, event="agent.finished")
                 seen_commands.pop(row["id"], None)
             return
 
@@ -812,7 +898,7 @@ done
         # The pane started a Pi process and that process has now exited
         # (the shell is back at the prompt).
         if prev == "pi" and cmd != "pi":
-            self._mark_status(row["id"], "finished", ended=True)
+            self._mark_status(row["id"], "finished", ended=True, event="agent.finished")
             seen_commands.pop(row["id"], None)
 
     def serve(self):
@@ -868,7 +954,7 @@ done
 def main():
     parser = argparse.ArgumentParser(description="Agent orchestration runtime supervisor")
     parser.add_argument("command", choices=["init", "create-session", "serve", "spawn", "send",
-                                             "status", "stop", "kill-all", "sessions", "ptylog"])
+                                             "status", "monitor", "stop", "kill-all", "sessions", "ptylog"])
     parser.add_argument("name", nargs="?", default=None)
     parser.add_argument("task", nargs="*", default=None)
     parser.add_argument("--agent-id", dest="agent_id", default=None)
@@ -906,6 +992,9 @@ def main():
 
     elif args.command == "status":
         orchestrator.status()
+
+    elif args.command == "monitor":
+        orchestrator.monitor()
 
     elif args.command == "stop":
         if not args.name:
