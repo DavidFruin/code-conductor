@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+.agents/sessions/
+.agents/pty_logs/
+.agents/comms/
+.agents/agents.sqlite*
